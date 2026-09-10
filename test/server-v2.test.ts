@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
-import { getGoal, getGoalInternal, recordContinuationResult, reserveContinuation } from "../src/state"
+import { createGoal, getGoal, getGoalInternal, recordContinuationResult, reserveContinuation } from "../src/state"
 
 const TOOL_NAMES = [
   "clear_goal",
@@ -91,6 +91,7 @@ type MockContext = {
   commands: Array<MockCommandDraft["add"] extends (command: infer T) => void ? T : never>
   hooks: Record<string, (input: unknown) => void>
   systemParts: Array<{ type: string; text: string }>
+  contextCalls: string[]
   stream: ReturnType<typeof controlledStream>
   disposals: string[]
   command: {
@@ -107,17 +108,23 @@ type MockContext = {
       sessionID: string
       delivery?: "steer" | "queue"
     } & MockPrompt) => Promise<unknown>
+    context: (input: { sessionID: string }) => Promise<unknown[]>
   }
   event: {
     subscribe: (options?: { signal?: AbortSignal }) => AsyncIterable<unknown>
   }
 }
 
-function makeMockContext(options: Record<string, unknown> = {}, existingCommands: string[] = []): MockContext {
+function makeMockContext(
+  options: Record<string, unknown> = {},
+  existingCommands: string[] = [],
+  transcripts: Record<string, unknown[]> = {},
+): MockContext {
   const tools: MockContext["tools"] = []
   const commands: MockContext["commands"] = []
   const hooks: MockContext["hooks"] = {}
   const promptCalls: MockContext["promptCalls"] = []
+  const contextCalls: string[] = []
   const disposals: string[] = []
   const stream = controlledStream()
   const registration = (name: string): Registration => ({
@@ -132,6 +139,7 @@ function makeMockContext(options: Record<string, unknown> = {}, existingCommands
     commands,
     hooks,
     systemParts: [],
+    contextCalls,
     stream,
     disposals,
     command: {
@@ -159,6 +167,10 @@ function makeMockContext(options: Record<string, unknown> = {}, existingCommands
       prompt: async (input) => {
         promptCalls.push(input)
         return { id: "pending_1" }
+      },
+      context: async (input) => {
+        contextCalls.push(input.sessionID)
+        return transcripts[input.sessionID] ?? []
       },
     },
     event: {
@@ -686,6 +698,52 @@ test("V2 compaction hook preserves the active goal for the summarizer", async ()
   const foreign = { sessionID: "ses_other", agent: "build", system: [] as Array<{ type: string; text: string }>, messages: [], tools: {} }
   await compactionHook(foreign)
   expect(foreign.system).toHaveLength(0)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 rebuilds task deferral from session transcripts after a plugin restart", async () => {
+  await createGoal("ses_v2", "Verify transcript-based task recovery")
+  const transcript = [
+    {
+      id: "msg_a",
+      type: "assistant",
+      agent: "build",
+      time: { created: 1, completed: 2 },
+      content: [
+        {
+          type: "tool",
+          id: "call_t1",
+          name: "task",
+          state: { status: "completed", input: {}, content: [{ type: "text", text: "task_id: T_recover\nstate: running" }] },
+        },
+      ],
+    },
+  ]
+  await countTaskBlockRearms(async (rearms) => {
+    const mock = makeMockContext({}, [], { ses_v2: transcript })
+    const cleanup = await setupPlugin(mock as never)
+    await waitFor(() => mock.contextCalls.includes("ses_v2"))
+
+    await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+    await waitFor(() => rearms() >= 1)
+    expect(mock.promptCalls).toHaveLength(0)
+
+    mock.stream.end()
+    await cleanup()
+  })
+})
+
+test("V2 continuation proceeds after restart when transcripts show no blocking tasks", async () => {
+  await createGoal("ses_v2", "Verify continuation without recovered tasks")
+  const mock = makeMockContext({}, [], { ses_v2: [] })
+  const cleanup = await setupPlugin(mock as never)
+  await waitFor(() => mock.contextCalls.includes("ses_v2"))
+
+  await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+  await waitFor(() => mock.promptCalls.length > 0)
+  expect(mock.promptCalls[0]!.text).toContain("Continue working toward the active session goal")
 
   mock.stream.end()
   await cleanup()

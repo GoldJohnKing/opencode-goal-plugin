@@ -2,6 +2,7 @@ import type { Config, Plugin } from "@opencode-ai/plugin"
 import type * as PluginV2 from "@opencode/plugin"
 import type { Info as ToolV2Info } from "@opencode/plugin/promise/tool"
 import type { Tool as ToolSchema } from "@opencode/schema/tool"
+import type { SessionMessageInfo } from "@opencode/client"
 import { z } from "zod"
 import type { GoalSnapshot, InternalGoalSnapshot, PendingAttempt } from "./state"
 import {
@@ -670,6 +671,23 @@ class TaskTracker {
     if (marker) this.observeAssistant(sessionID, marker)
   }
 
+  // Restart recovery on V2: the plugin context exposes no live child-session
+  // query, so rebuild deferral state from each goal session's persisted
+  // transcript. Only finalized tool entries carry trustworthy status text.
+  recoverFromTranscript(parentSessionID: string, messages: readonly SessionMessageInfo[]) {
+    for (const message of messages) {
+      if (message.type !== "assistant") continue
+      for (const entry of message.content) {
+        if (entry.type !== "tool" || !["task", "subagent"].includes(entry.name.toLowerCase())) continue
+        if (entry.state.status === "streaming" || entry.state.status === "running") continue
+        const status = parseTaskStatus(toolTextFromV2Content(entry.state.content ?? []))
+        if (!status) continue
+        if (status.state === "running") this.markRunning(parentSessionID, status.taskID)
+        else this.markTerminal(status.taskID, status.state, parentSessionID, { resetReconciled: true })
+      }
+    }
+  }
+
   hasBlockingTasks(parentSessionID: string, maxBlockMs: number | null = null) {
     this.pruneExpiredSnapshotIdleHolds()
     const now = Date.now()
@@ -1082,6 +1100,14 @@ function textFromToolResult(result: { output?: unknown; content?: unknown }): st
     return text || undefined
   }
   return undefined
+}
+
+function toolTextFromV2Content(content: readonly unknown[]) {
+  return content
+    .map((entry) => (isRecord(entry) && entry.type === "text" && typeof entry.text === "string" ? entry.text : ""))
+    .filter(Boolean)
+    .join("\n")
+    .trim()
 }
 
 // Tool calls are correlated to the pending attempt that was active when they
@@ -2577,6 +2603,25 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (!abortController.signal.aborted) v2ErrorLog("V2 event consumer stopped", error)
     }
   })()
+
+  // Rebuild task-deferral state for goals that survived a plugin restart. The
+  // plugin context exposes no live child-session query, so this replays each
+  // non-closed goal session's persisted transcript through the tracker. Best
+  // effort: unfetchable transcripts fall back to live-event observation only.
+  async function recoverTrackedTasks() {
+    for (const item of (await getAllGoals()).goals) {
+      if (disposed) return
+      if (item.status === "complete" || item.status === "unmet") continue
+      try {
+        const transcript = await context.session.context({ sessionID: item.sessionID })
+        if (disposed) return
+        taskTracker.recoverFromTranscript(item.sessionID, transcript)
+      } catch (error) {
+        v2ErrorLog("Task recovery from transcript failed", error)
+      }
+    }
+  }
+  void recoverTrackedTasks()
 
   return async () => {
     disposed = true
