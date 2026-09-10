@@ -1596,15 +1596,17 @@ test("V2 watchdog no-response counts a failure on idle even with auto_continue f
   await createGoalViaV2Tool(mock, "watchdog no response with auto-continue disabled")
 
   mock.stream.push({ type: "session.status", created: Date.now(), data: { sessionID: "ses_v2", status: { type: "busy" } } })
-  await waitFor(async () => (await getGoalInternal("ses_v2"))?.pendingAttempt?.started === true)
-  await waitFor(() => mock.promptCalls.length === 1)
+  // The 20ms watchdog plus its state-file round-trips needs slack on slow
+  // filesystems, so this test uses an extended waitFor deadline.
+  await waitFor(async () => (await getGoalInternal("ses_v2"))?.pendingAttempt?.started === true, 10_000)
+  await waitFor(() => mock.promptCalls.length === 1, 10_000)
   expect((await getGoal("ses_v2"))?.autoTurns).toBe(0)
 
   // The busy episode ends with no response: the started pending attempt counts
   // exactly one unresolved failure even though auto-continue is disabled, and
   // no retry is scheduled.
   mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
-  await waitFor(async () => (await getGoal("ses_v2"))?.continuationFailures === 1)
+  await waitFor(async () => (await getGoal("ses_v2"))?.continuationFailures === 1, 10_000)
 
   const goal = await getGoal("ses_v2")
   expect(goal?.continuationFailures).toBe(1)
