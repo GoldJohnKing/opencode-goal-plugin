@@ -666,6 +666,31 @@ test("V2 session context hook injects the goal-mode system reminder", async () =
   await cleanup()
 })
 
+test("V2 compaction hook preserves the active goal for the summarizer", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "Ship the compaction-safe goal feature")
+
+  const compactionHook = mock.hooks["compaction"]!
+  expect(compactionHook).toBeTypeOf("function")
+  const compaction = { sessionID: "ses_v2", agent: "build", system: [] as Array<{ type: string; text: string }>, messages: [], tools: {} }
+  await compactionHook(compaction)
+  expect(compaction.system.some((part) => part.type === "text" && part.text.includes("OpenCode goal mode is tracking this session goal across compaction."))).toBe(true)
+  expect(compaction.system.some((part) => part.type === "text" && part.text.includes("Ship the compaction-safe goal feature"))).toBe(true)
+
+  // The snapshot is not duplicated on a second compaction request.
+  await compactionHook(compaction)
+  expect(compaction.system.filter((part) => part.type === "text" && part.text.includes("OpenCode goal mode is tracking"))).toHaveLength(1)
+
+  // Sessions without a goal are left untouched.
+  const foreign = { sessionID: "ses_other", agent: "build", system: [] as Array<{ type: string; text: string }>, messages: [], tools: {} }
+  await compactionHook(foreign)
+  expect(foreign.system).toHaveLength(0)
+
+  mock.stream.end()
+  await cleanup()
+})
+
 test("V2 setup registers tool execute hooks", async () => {
   const mock = makeMockContext({ auto_continue: false })
   const cleanup = await setupPlugin(mock as never)

@@ -32,7 +32,7 @@ import {
   validateEvidence,
   validateObjective,
 } from "./state"
-import { compactionContext, continuationPrompt, limitPrompt, systemReminder } from "./prompts"
+import { COMPACTION_CONTEXT_PREFIX, compactionContext, continuationPrompt, limitPrompt, systemReminder } from "./prompts"
 
 type Options = {
   auto_continue?: boolean
@@ -1067,6 +1067,11 @@ type V2StepRecord = {
   text: string
   outputTokens: number | null
   completedAt: number | null
+}
+
+type V2CompactionHookEvent = {
+  readonly sessionID: string
+  system: Array<{ type: string; text: string }>
 }
 
 function textFromToolResult(result: { output?: unknown; content?: unknown }): string | undefined {
@@ -2531,6 +2536,29 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       sessionContext.system.push({ type: "text", text: reminder })
     }),
   )
+
+  // V2 equivalent of the V1 experimental.session.compacting hook: keep the
+  // active goal visible to the summarizer so compaction cannot drop it. The
+  // compaction hook ships in V2 builds newer than beta-19425 (the newest
+  // published beta this package targets), so register it defensively: hosts
+  // that predate the hook reject or ignore the registration, while newer
+  // hosts preserve the active goal across compaction.
+  try {
+    const hookCompaction = context.session.hook as unknown as (
+      name: "compaction",
+      callback: (event: V2CompactionHookEvent) => Promise<void>,
+    ) => Promise<{ dispose(): Promise<void> }>
+    registrations.push(
+      await hookCompaction("compaction", async (event) => {
+        const goal = await getGoal(event.sessionID)
+        if (!goal) return
+        if (event.system.some((part) => part.type === "text" && part.text.startsWith(COMPACTION_CONTEXT_PREFIX))) return
+        event.system.push({ type: "text", text: compactionContext(goal) })
+      }),
+    )
+  } catch {
+    // Host predates the session compaction hook.
+  }
 
   const abortController = new AbortController()
   let eventIterator: AsyncIterator<unknown> | undefined
