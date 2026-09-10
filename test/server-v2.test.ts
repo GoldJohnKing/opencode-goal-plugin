@@ -1276,13 +1276,13 @@ test("V2 cleanup disposes registrations and stops the event consumer", async () 
   expect(contentOf(read)).toContain('"tokensUsed": 0')
 })
 
-test("V2 session.error schedules bounded recovery without a phantom failure", async () => {
+test("V2 execution failure schedules bounded recovery without a phantom failure", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
   const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "recover from a transport error")
 
   mock.stream.push({
-    type: "session.error",
+    type: "session.execution.failed",
     created: Date.now(),
     data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
   })
@@ -1436,7 +1436,7 @@ test("V2 retry status cancels scheduled transport recovery", async () => {
   await createGoalViaV2Tool(mock, "let the native retry win")
 
   mock.stream.push({
-    type: "session.error",
+    type: "session.execution.failed",
     created: 1,
     data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
   })
@@ -1469,7 +1469,7 @@ test("V2 successful tool progress cancels no-pending transport recovery", async 
   })
 
   mock.stream.push({
-    type: "session.error",
+    type: "session.execution.failed",
     created: 1,
     data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
   })
@@ -1505,7 +1505,7 @@ test("V2 assistant progress cancels no-pending transport recovery", async () => 
   await createGoalViaV2Tool(mock, "cancel recovery via assistant progress")
 
   mock.stream.push({
-    type: "session.error",
+    type: "session.execution.failed",
     created: 1,
     data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
   })
@@ -1567,35 +1567,24 @@ test("V2 non-transport prompt errors do not count toward the ceiling or retry", 
   await cleanup()
 })
 
-test("V2 a native retry status suppresses a later session.error until busy ends the episode", async () => {
+test("V2 execution.failed after a native retry episode still recovers", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_prompt_failures: 3 })
   const cleanup = await setupPlugin(mock as never)
-  await createGoalViaV2Tool(mock, "native retry must win")
+  await createGoalViaV2Tool(mock, "native retry must not strand the goal")
 
-  // retry arrives before the transport error; the error is suppressed while
-  // the provider is already retrying.
+  // retry arrives before the terminal failure; execution.failed is emitted only
+  // after the host's retry episode has ended, so the plugin may recover.
   mock.stream.push({ type: "session.status", created: 1, data: { sessionID: "ses_v2", status: { type: "retry" } } })
   mock.stream.push({
-    type: "session.error",
+    type: "session.execution.failed",
     created: 2,
-    data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
-  })
-  await new Promise((resolve) => setTimeout(resolve, 100))
-
-  expect(mock.promptCalls).toHaveLength(0)
-  const suppressed = await getGoal("ses_v2")
-  expect(suppressed?.continuationFailures).toBe(0)
-  expect(suppressed?.status).toBe("active")
-
-  // busy ends the retry episode; a later transport error may then recover.
-  mock.stream.push({ type: "session.status", created: 3, data: { sessionID: "ses_v2", status: { type: "busy" } } })
-  mock.stream.push({
-    type: "session.error",
-    created: 4,
     data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
   })
   await waitFor(() => mock.promptCalls.length === 1)
   expect(mock.promptCalls[0]?.text).toContain("Continue working toward the active session goal")
+  const goal = await getGoal("ses_v2")
+  expect(goal?.continuationFailures).toBe(0)
+  expect(goal?.status).toBe("active")
 
   mock.stream.end()
   await cleanup()
@@ -1717,7 +1706,7 @@ test("V2 commits an accepted prompt when its recovery timer is canceled in fligh
   await createGoalViaV2Tool(mock, "commit accepted recovery")
 
   mock.stream.push({
-    type: "session.error",
+    type: "session.execution.failed",
     created: Date.now(),
     data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
   })

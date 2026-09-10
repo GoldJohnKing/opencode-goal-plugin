@@ -2246,28 +2246,21 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         taskTracker.observeSessionStatus(sessionID, "idle")
         return
       }
-      case "session.execution.failed":
-      case "session.error": {
+      case "session.execution.failed": {
         if (!sessionID) return
         // execution.failed is emitted only after the host's retry episode has
-        // ended. Unlike a legacy session.error inside a retry, it can recover.
-        if (event.type === "session.execution.failed") nativeRetrySessions.delete(sessionID)
-        const inNativeRetry = nativeRetrySessions.has(sessionID)
+        // ended, so the failure can still recover.
+        nativeRetrySessions.delete(sessionID)
         busySessions.delete(sessionID)
         clearTurnWatchdog(sessionID)
-        // Same policy as V1: a native provider retry episode is already
-        // recovering, so a transport error inside it must not schedule plugin
-        // recovery, and the marker stays until busy/idle ends the episode.
-        if (inNativeRetry) return
-        nativeRetrySessions.delete(sessionID)
         watchdogRescuedSessions.delete(sessionID)
         const errorMessage = transportErrorMessageFromEvent(data)
-        if (event.type === "session.execution.failed" && !isTransportError(errorMessage)) {
+        if (!isTransportError(errorMessage)) {
           stoppedExecutions.add(sessionID)
           cancelScheduledContinuation(sessionID)
           taskDeferredSessions.delete(sessionID)
         }
-        if (event.type === "session.execution.failed") taskTracker.observeSessionStatus(sessionID, "idle")
+        taskTracker.observeSessionStatus(sessionID, "idle")
         if (errorMessage && isTransportError(errorMessage)) {
           const goal = await getGoalInternal(sessionID)
           if (goal?.status === "active") {
