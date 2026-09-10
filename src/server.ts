@@ -1,7 +1,7 @@
 import type { Config, Plugin } from "@opencode-ai/plugin"
-import type * as PluginV2 from "@opencode-ai/plugin-v2"
-import type { Info as ToolV2Info } from "@opencode-ai/plugin-v2/promise/tool"
-import type { Tool as ToolSchema } from "@opencode-ai/schema/tool"
+import type * as PluginV2 from "@opencode/plugin"
+import type { Info as ToolV2Info } from "@opencode/plugin/promise/tool"
+import type { Tool as ToolSchema } from "@opencode/schema/tool"
 import { z } from "zod"
 import type { GoalSnapshot, InternalGoalSnapshot, PendingAttempt } from "./state"
 import {
