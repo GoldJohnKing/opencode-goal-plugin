@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
+import { satisfies } from "semver"
 
 test("published tui entrypoint shares host runtime instances via peerDependencies", () => {
   const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {
@@ -17,5 +18,23 @@ test("published tui entrypoint shares host runtime instances via peerDependencie
     expect(packageJson.dependencies?.[dependency]).toBeUndefined()
     // Local development keeps its own copies for typecheck and tests.
     expect(packageJson.devDependencies?.[dependency]).toBeString()
+  }
+})
+
+test("engines.opencode covers the V2 beta line and the V1 floor while excluding older stable releases", () => {
+  const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {
+    engines?: Record<string, string>
+  }
+  const range = packageJson.engines?.opencode
+  expect(range).toBeString()
+  if (typeof range !== "string") throw new Error("expected engines.opencode to be a string range")
+
+  // The range must cover the 0.0.0-beta-* V2 line and the V1 floor 1.17.1
+  // while excluding unsupported stable pre-1.17.1 releases.
+  for (const version of ["0.0.0-beta-0", "0.0.0-beta-19425", "1.17.1", "1.17.2", "2.0.0"]) {
+    expect(satisfies(version, range)).toBe(true)
+  }
+  for (const version of ["0.0.0", "0.0.1", "0.5.0", "1.0.0", "1.17.0"]) {
+    expect(satisfies(version, range)).toBe(false)
   }
 })
