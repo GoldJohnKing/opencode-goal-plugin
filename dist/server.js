@@ -1785,6 +1785,12 @@ class TaskTracker {
     for (const message of messages) {
       if (message.type !== "assistant")
         continue;
+      if (typeof message.id === "string") {
+        this.observeAssistantMessage(parentSessionID, {
+          info: { id: message.id, role: "assistant", time: message.time }
+        });
+      }
+      const terminalAt = messageCompletedAt({ time: message.time }) ?? undefined;
       for (const entry of message.content) {
         if (entry.type !== "tool" || !["task", "subagent"].includes(entry.name.toLowerCase()))
           continue;
@@ -1796,7 +1802,7 @@ class TaskTracker {
         if (status.state === "running")
           this.markRunning(parentSessionID, status.taskID);
         else
-          this.markTerminal(status.taskID, status.state, parentSessionID, { resetReconciled: true });
+          this.markTerminal(status.taskID, status.state, parentSessionID, { resetReconciled: true, terminalAt });
       }
     }
   }
@@ -1894,7 +1900,7 @@ class TaskTracker {
       state,
       terminalUnreconciled: true,
       runningSince: null,
-      terminalAt: continuesExistingTerminal ? existing.terminalAt ?? Date.now() : Date.now(),
+      terminalAt: options.terminalAt ?? (continuesExistingTerminal ? existing.terminalAt ?? Date.now() : Date.now()),
       lastAssistantMessageIDAtTerminal: continuesExistingTerminal ? existing.lastAssistantMessageIDAtTerminal : this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null
     });
   }
@@ -2804,6 +2810,7 @@ async function setupV2(context) {
     try {
       if (disposed)
         return;
+      await taskRecoveryComplete;
       if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID) || watchdogRescuedSessions.has(sessionID))
         return;
       const goal = await getGoal(sessionID);
@@ -2894,6 +2901,9 @@ async function setupV2(context) {
     if (busySessions.has(sessionID))
       return;
     if (activeContinuationsV2.has(sessionID))
+      return;
+    await taskRecoveryComplete;
+    if (disposed || stoppedExecutions.has(sessionID) || busySessions.has(sessionID))
       return;
     activeContinuationsV2.add(sessionID);
     let attemptReservedAt = Date.now();
@@ -3408,6 +3418,25 @@ async function setupV2(context) {
       event.system.push({ type: "text", text: compactionContext(goal) });
     }));
   } catch {}
+  async function recoverTrackedTasks() {
+    for (const item of (await getAllGoals()).goals) {
+      if (disposed)
+        return;
+      if (item.status === "complete" || item.status === "unmet")
+        continue;
+      try {
+        const transcript = await context.session.context({ sessionID: item.sessionID });
+        if (disposed)
+          return;
+        taskTracker.recoverFromTranscript(item.sessionID, transcript);
+      } catch (error) {
+        v2ErrorLog("Task recovery from transcript failed", error);
+      }
+    }
+  }
+  const taskRecoveryComplete = recoverTrackedTasks().catch((error) => {
+    v2ErrorLog("Task recovery from transcript failed", error);
+  });
   const abortController = new AbortController;
   let eventIterator;
   const consumer = (async () => {
@@ -3428,23 +3457,6 @@ async function setupV2(context) {
         v2ErrorLog("V2 event consumer stopped", error);
     }
   })();
-  async function recoverTrackedTasks() {
-    for (const item of (await getAllGoals()).goals) {
-      if (disposed)
-        return;
-      if (item.status === "complete" || item.status === "unmet")
-        continue;
-      try {
-        const transcript = await context.session.context({ sessionID: item.sessionID });
-        if (disposed)
-          return;
-        taskTracker.recoverFromTranscript(item.sessionID, transcript);
-      } catch (error) {
-        v2ErrorLog("Task recovery from transcript failed", error);
-      }
-    }
-  }
-  recoverTrackedTasks();
   return async () => {
     disposed = true;
     abortController.abort();

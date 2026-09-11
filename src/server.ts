@@ -674,16 +674,29 @@ class TaskTracker {
   // Restart recovery on V2: the plugin context exposes no live child-session
   // query, so rebuild deferral state from each goal session's persisted
   // transcript. Only finalized tool entries carry trustworthy status text.
+  // The replay includes assistant markers so a terminal child is reconciled
+  // by any later orchestrator turn in the transcript, mirroring live V2
+  // semantics where a task that goes terminal mid-turn is stamped with its
+  // own message's marker. Terminal timestamps are historical when the message
+  // carries time.completed; running children keep a restart-time runningSince
+  // (conservative - prevents an old-but-alive child from expiring the block
+  // ceiling immediately after restart).
   recoverFromTranscript(parentSessionID: string, messages: readonly SessionMessageInfo[]) {
     for (const message of messages) {
       if (message.type !== "assistant") continue
+      if (typeof message.id === "string") {
+        this.observeAssistantMessage(parentSessionID, {
+          info: { id: message.id, role: "assistant", time: message.time },
+        })
+      }
+      const terminalAt = messageCompletedAt({ time: message.time }) ?? undefined
       for (const entry of message.content) {
         if (entry.type !== "tool" || !["task", "subagent"].includes(entry.name.toLowerCase())) continue
         if (entry.state.status === "streaming" || entry.state.status === "running") continue
         const status = parseTaskStatus(toolTextFromV2Content(entry.state.content ?? []))
         if (!status) continue
         if (status.state === "running") this.markRunning(parentSessionID, status.taskID)
-        else this.markTerminal(status.taskID, status.state, parentSessionID, { resetReconciled: true })
+        else this.markTerminal(status.taskID, status.state, parentSessionID, { resetReconciled: true, terminalAt })
       }
     }
   }
@@ -765,7 +778,7 @@ class TaskTracker {
     taskID: string,
     state: TaskState,
     parentSessionID?: string,
-    options: { resetReconciled?: boolean } = {},
+    options: { resetReconciled?: boolean; terminalAt?: number } = {},
   ) {
     if (!TASK_TERMINAL_STATES.has(state)) return
     const existing = this.tasks.get(taskID)
@@ -799,7 +812,7 @@ class TaskTracker {
       state,
       terminalUnreconciled: true,
       runningSince: null,
-      terminalAt: continuesExistingTerminal ? existing.terminalAt ?? Date.now() : Date.now(),
+      terminalAt: options.terminalAt ?? (continuesExistingTerminal ? existing.terminalAt ?? Date.now() : Date.now()),
       lastAssistantMessageIDAtTerminal: continuesExistingTerminal
         ? existing.lastAssistantMessageIDAtTerminal
         : this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null,
@@ -1896,6 +1909,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     let claimedContinuation = false
     try {
       if (disposed) return
+      await taskRecoveryComplete
       if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID) || watchdogRescuedSessions.has(sessionID))
         return
       const goal = await getGoal(sessionID)
@@ -1981,6 +1995,11 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     if (stoppedExecutions.has(sessionID)) return
     if (busySessions.has(sessionID)) return
     if (activeContinuationsV2.has(sessionID)) return
+    // Transcript recovery must settle before any continuation decision;
+    // otherwise the first lifecycle event after a restart defers to a task
+    // state that has not been rebuilt yet.
+    await taskRecoveryComplete
+    if (disposed || stoppedExecutions.has(sessionID) || busySessions.has(sessionID)) return
     activeContinuationsV2.add(sessionID)
     let attemptReservedAt = Date.now()
     try {
@@ -2579,6 +2598,31 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     // Host predates the session compaction hook.
   }
 
+  // Rebuild task-deferral state for goals that survived a plugin restart. The
+  // plugin context exposes no live child-session query, so this replays each
+  // non-closed goal session's persisted transcript through the tracker. Best
+  // effort: unfetchable transcripts fall back to live-event observation only.
+  // Continuation decisions await this recovery, so a settled lifecycle event
+  // cannot slip past a pending transcript load.
+  async function recoverTrackedTasks() {
+    for (const item of (await getAllGoals()).goals) {
+      if (disposed) return
+      if (item.status === "complete" || item.status === "unmet") continue
+      try {
+        const transcript = await context.session.context({ sessionID: item.sessionID })
+        if (disposed) return
+        taskTracker.recoverFromTranscript(item.sessionID, transcript)
+      } catch (error) {
+        v2ErrorLog("Task recovery from transcript failed", error)
+      }
+    }
+  }
+  // The catch guarantees this promise never rejects: the per-item try/catch
+  // inside recoverTrackedTasks does not cover a getAllGoals() rejection.
+  const taskRecoveryComplete = recoverTrackedTasks().catch((error) => {
+    v2ErrorLog("Task recovery from transcript failed", error)
+  })
+
   const abortController = new AbortController()
   let eventIterator: AsyncIterator<unknown> | undefined
   const consumer = (async () => {
@@ -2596,25 +2640,6 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (!abortController.signal.aborted) v2ErrorLog("V2 event consumer stopped", error)
     }
   })()
-
-  // Rebuild task-deferral state for goals that survived a plugin restart. The
-  // plugin context exposes no live child-session query, so this replays each
-  // non-closed goal session's persisted transcript through the tracker. Best
-  // effort: unfetchable transcripts fall back to live-event observation only.
-  async function recoverTrackedTasks() {
-    for (const item of (await getAllGoals()).goals) {
-      if (disposed) return
-      if (item.status === "complete" || item.status === "unmet") continue
-      try {
-        const transcript = await context.session.context({ sessionID: item.sessionID })
-        if (disposed) return
-        taskTracker.recoverFromTranscript(item.sessionID, transcript)
-      } catch (error) {
-        v2ErrorLog("Task recovery from transcript failed", error)
-      }
-    }
-  }
-  void recoverTrackedTasks()
 
   return async () => {
     disposed = true

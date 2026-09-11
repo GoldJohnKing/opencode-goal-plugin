@@ -118,7 +118,7 @@ type MockContext = {
 function makeMockContext(
   options: Record<string, unknown> = {},
   existingCommands: string[] = [],
-  transcripts: Record<string, unknown[]> = {},
+  transcripts: Record<string, unknown[] | Promise<unknown[]>> = {},
 ): MockContext {
   const tools: MockContext["tools"] = []
   const commands: MockContext["commands"] = []
@@ -738,6 +738,120 @@ test("V2 rebuilds task deferral from session transcripts after a plugin restart"
 test("V2 continuation proceeds after restart when transcripts show no blocking tasks", async () => {
   await createGoal("ses_v2", "Verify continuation without recovered tasks")
   const mock = makeMockContext({}, [], { ses_v2: [] })
+  const cleanup = await setupPlugin(mock as never)
+  await waitFor(() => mock.contextCalls.includes("ses_v2"))
+
+  await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+  await waitFor(() => mock.promptCalls.length > 0)
+  expect(mock.promptCalls[0]!.text).toContain("Continue working toward the active session goal")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 defers continuation until transcript recovery completes when a settled event races the recovery", async () => {
+  await createGoal("ses_v2", "Verify recovery gating on settled events")
+  let resolveTranscript: (messages: unknown[]) => void = () => {}
+  const transcriptPromise = new Promise<unknown[]>((resolve) => {
+    resolveTranscript = resolve
+  })
+  const mock = makeMockContext({}, [], { ses_v2: transcriptPromise })
+  await countTaskBlockRearms(async (rearms) => {
+    const cleanup = await setupPlugin(mock as never)
+
+    // The push is intentionally not awaited: the event handler now parks on
+    // transcript recovery, so awaiting full processing would deadlock against
+    // the deferred resolved below.
+    mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+    await waitFor(() => mock.contextCalls.includes("ses_v2"))
+    resolveTranscript([
+      {
+        id: "msg_race",
+        type: "assistant",
+        agent: "build",
+        time: { created: 1, completed: 2 },
+        content: [
+          {
+            type: "tool",
+            id: "call_race",
+            name: "task",
+            state: { status: "completed", input: {}, content: [{ type: "text", text: "task_id: T_race\nstate: running" }] },
+          },
+        ],
+      },
+    ])
+
+    await waitFor(() => rearms() >= 1)
+    expect(mock.promptCalls).toHaveLength(0)
+
+    mock.stream.end()
+    await cleanup()
+  })
+})
+
+test("V2 reconciles a transcript-terminal task via a later assistant message and continues", async () => {
+  await createGoal("ses_v2", "Verify terminal task reconciliation from transcripts")
+  const transcript = [
+    {
+      id: "msg_tool_done",
+      type: "assistant",
+      agent: "build",
+      time: { created: 1, completed: 2 },
+      content: [
+        {
+          type: "tool",
+          id: "call_done",
+          name: "task",
+          state: { status: "completed", input: {}, content: [{ type: "text", text: "task_id: T_done\nstate: completed" }] },
+        },
+      ],
+    },
+    {
+      id: "msg_after_done",
+      type: "assistant",
+      agent: "build",
+      time: { created: 3, completed: 4 },
+      content: [{ type: "text", text: "The tracked task finished; summarizing its results." }],
+    },
+  ]
+  const mock = makeMockContext({}, [], { ses_v2: transcript })
+  const cleanup = await setupPlugin(mock as never)
+  await waitFor(() => mock.contextCalls.includes("ses_v2"))
+
+  await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+  await waitFor(() => mock.promptCalls.length > 0)
+  expect(mock.promptCalls[0]!.text).toContain("Continue working toward the active session goal")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 reconciles a transcript-terminal failed task via a later assistant message and continues", async () => {
+  await createGoal("ses_v2", "Verify failed task reconciliation from transcripts")
+  const transcript = [
+    {
+      id: "msg_tool_fail",
+      type: "assistant",
+      agent: "build",
+      time: { created: 1, completed: 2 },
+      content: [
+        {
+          type: "tool",
+          id: "call_fail",
+          name: "task",
+          state: { status: "completed", input: {}, content: [{ type: "text", text: "task_id: T_fail\nstate: error" }] },
+        },
+      ],
+    },
+    {
+      id: "msg_after_fail",
+      type: "assistant",
+      agent: "build",
+      time: { created: 3, completed: 4 },
+      content: [{ type: "text", text: "The tracked task failed; recording the error." }],
+    },
+  ]
+  const mock = makeMockContext({}, [], { ses_v2: transcript })
   const cleanup = await setupPlugin(mock as never)
   await waitFor(() => mock.contextCalls.includes("ses_v2"))
 
