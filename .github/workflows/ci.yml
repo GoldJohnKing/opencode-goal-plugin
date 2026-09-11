@@ -74,3 +74,11 @@ jobs:
       - run: bun run smoke:v2
         env:
           OPENCODE_SMOKE_TIMEOUT_MS: "120000"
+          OPENCODE_SMOKE_ARTIFACTS_DIR: ${{ runner.temp }}/smoke-artifacts
+      - name: Upload smoke artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2-smoke-artifacts
+          path: ${{ runner.temp }}/smoke-artifacts
+          if-no-files-found: ignore
