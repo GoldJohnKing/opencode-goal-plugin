@@ -1871,6 +1871,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   }
 
   async function sendContinuation(sessionID: string, prompt: string, agent?: string | null) {
+    // Delivering a prompt for a session proves this instance owns it.
+    markSessionOwnership(sessionID, true)
     await context.session.prompt({
       sessionID,
       text: prompt,
@@ -2165,16 +2167,92 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     }
   }
 
+  // Session events from event.subscribe() are delivered server-wide to every
+  // loaded location's plugin instance, and the session events themselves carry
+  // no envelope `location` (routing metadata stays inside the host bus). The
+  // shared goal state file must therefore only ever be mutated by the instance
+  // that hosts the session's location; sibling instances have separate
+  // in-process mutation queues, and interleaved read-modify-write across them
+  // loses updates (undercounted autoTurns, dropped reservations). Ownership is
+  // resolved from the session's own location, never inferred from the event
+  // envelope alone, and both positive and negative answers are cached per
+  // session so foreign instances stay read-only.
+  const sessionOwnership = new Map<string, boolean>()
+  const ownershipInFlight = new Map<string, Promise<boolean>>()
+
+  function locationRefMatches(
+    observed: { directory?: unknown; workspaceID?: unknown } | null | undefined,
+    own: { directory?: unknown; workspaceID?: unknown } | null | undefined,
+  ): boolean {
+    if (!observed || !own) return false
+    if (typeof observed.directory !== "string" || observed.directory !== own.directory) return false
+    const observedWorkspace = typeof observed.workspaceID === "string" ? observed.workspaceID : null
+    const ownWorkspace = typeof own.workspaceID === "string" ? own.workspaceID : null
+    return observedWorkspace === ownWorkspace
+  }
+
+  function markSessionOwnership(sessionID: string, owned: boolean) {
+    sessionOwnership.set(sessionID, owned)
+  }
+
+  async function ownsSession(sessionID: string): Promise<boolean> {
+    if (!context.location) return true
+    const cached = sessionOwnership.get(sessionID)
+    if (cached !== undefined) return cached
+    const inFlight = ownershipInFlight.get(sessionID)
+    if (inFlight) return inFlight
+    const resolution = (async () => {
+      try {
+        const response = await context.session.get({ sessionID })
+        const record = response as { data?: unknown } | undefined
+        const info = record && typeof record === "object" && "data" in record
+          ? record.data
+          : response
+        const location = (info as { location?: unknown } | null | undefined)?.location
+        const owned = locationRefMatches(
+          location as { directory?: unknown; workspaceID?: unknown } | null | undefined,
+          context.location,
+        )
+        sessionOwnership.set(sessionID, owned)
+        return owned
+      } catch {
+        // An unresolvable session is never mutated on a guess: treat it as
+        // foreign for this event without caching, so a transient lookup
+        // failure in the owning instance recovers on the next event.
+        return false
+      } finally {
+        ownershipInFlight.delete(sessionID)
+      }
+    })()
+    ownershipInFlight.set(sessionID, resolution)
+    return resolution
+  }
+
   async function handleV2Event(event: V2EventLike) {
     const data = event.data
     const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined
     // subscribe() is server-wide. Every loaded location has a plugin instance;
     // only the owner may account usage or send a goal prompt for this event.
     // Still observe foreign child lifecycles for cross-location Task deferral.
-    if (
-      context.location && event.location &&
-      (event.location.directory !== context.location.directory || event.location.workspaceID !== context.location.workspaceID)
-    ) {
+    // Ownership resolution: an explicit event envelope is authoritative when
+    // present; session.created carries the session's location in its data;
+    // every other session event (no envelope on the wire) is resolved against
+    // the session's actual location and cached. Without this, sibling
+    // locations' instances process the same events as owners and their
+    // independent mutation queues lose updates on the shared goal state.
+    let foreign = false
+    if (context.location && sessionID) {
+      if (event.location) {
+        foreign = !locationRefMatches(event.location, context.location)
+        markSessionOwnership(sessionID, !foreign)
+      } else if (event.type === "session.created" && isRecord(data.location)) {
+        foreign = !locationRefMatches(data.location as { directory?: unknown; workspaceID?: unknown }, context.location)
+        markSessionOwnership(sessionID, !foreign)
+      } else {
+        foreign = !(await ownsSession(sessionID))
+      }
+    }
+    if (foreign) {
       if (event.type === "session.created" && sessionID && typeof data.parentID === "string") {
         taskTracker.observeSessionCreated({ properties: { info: { id: sessionID, parentID: data.parentID } } })
       } else if (sessionID) {
@@ -2315,6 +2393,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       case "session.deleted": {
         if (!sessionID) return
         stoppedExecutions.delete(sessionID)
+        sessionOwnership.delete(sessionID)
         busySessions.delete(sessionID)
         clearTurnWatchdog(sessionID)
         watchdogRescuedSessions.delete(sessionID)
@@ -2461,6 +2540,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
             name: command.name,
             description: command.description,
             execute: async (input) => {
+              // Command execution is routed to the session's owning location.
+              markSessionOwnership(input.sessionID, true)
               if (command.action === "pause") {
                 const goal = await getGoal(input.sessionID)
                 if (goal?.status === "active") await setGoalStatus(input.sessionID, "paused")
@@ -2494,6 +2575,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     // their lifecycle action again at the shared prompt-admission boundary.
     registrations.push(
       await context.session.hook("prompt", async (input) => {
+        // Prompt hooks only fire in the session's owning location.
+        if (typeof input.sessionID === "string") markSessionOwnership(input.sessionID, true)
         const pauseTemplate = goalStatusCommandTemplate("pause_goal")
         const resumeTemplate = goalStatusCommandTemplate("resume_goal")
         const template = input.prompt.text.startsWith(pauseTemplate)
@@ -2525,6 +2608,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     await context.tool.hook("execute.before", async (input) => {
       taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id })
       const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
+      // Tool execution only happens in the session's owning location.
+      if (sessionID) markSessionOwnership(sessionID, true)
       const callID = typeof input.id === "string" ? input.id : undefined
       if (sessionID && callID) {
         const goal = await getGoalInternal(sessionID)

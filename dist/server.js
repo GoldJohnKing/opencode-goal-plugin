@@ -2770,6 +2770,7 @@ async function setupV2(context) {
     return `${sessionID}\x00${messageID}`;
   }
   async function sendContinuation(sessionID, prompt, agent) {
+    markSessionOwnership(sessionID, true);
     await context.session.prompt({
       sessionID,
       text: prompt,
@@ -3029,10 +3030,63 @@ async function setupV2(context) {
       activeContinuationsV2.delete(sessionID);
     }
   }
+  const sessionOwnership = new Map;
+  const ownershipInFlight = new Map;
+  function locationRefMatches(observed, own) {
+    if (!observed || !own)
+      return false;
+    if (typeof observed.directory !== "string" || observed.directory !== own.directory)
+      return false;
+    const observedWorkspace = typeof observed.workspaceID === "string" ? observed.workspaceID : null;
+    const ownWorkspace = typeof own.workspaceID === "string" ? own.workspaceID : null;
+    return observedWorkspace === ownWorkspace;
+  }
+  function markSessionOwnership(sessionID, owned) {
+    sessionOwnership.set(sessionID, owned);
+  }
+  async function ownsSession(sessionID) {
+    if (!context.location)
+      return true;
+    const cached = sessionOwnership.get(sessionID);
+    if (cached !== undefined)
+      return cached;
+    const inFlight = ownershipInFlight.get(sessionID);
+    if (inFlight)
+      return inFlight;
+    const resolution = (async () => {
+      try {
+        const response = await context.session.get({ sessionID });
+        const record = response;
+        const info = record && typeof record === "object" && "data" in record ? record.data : response;
+        const location = info?.location;
+        const owned = locationRefMatches(location, context.location);
+        sessionOwnership.set(sessionID, owned);
+        return owned;
+      } catch {
+        return false;
+      } finally {
+        ownershipInFlight.delete(sessionID);
+      }
+    })();
+    ownershipInFlight.set(sessionID, resolution);
+    return resolution;
+  }
   async function handleV2Event(event) {
     const data = event.data;
     const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined;
-    if (context.location && event.location && (event.location.directory !== context.location.directory || event.location.workspaceID !== context.location.workspaceID)) {
+    let foreign = false;
+    if (context.location && sessionID) {
+      if (event.location) {
+        foreign = !locationRefMatches(event.location, context.location);
+        markSessionOwnership(sessionID, !foreign);
+      } else if (event.type === "session.created" && isRecord(data.location)) {
+        foreign = !locationRefMatches(data.location, context.location);
+        markSessionOwnership(sessionID, !foreign);
+      } else {
+        foreign = !await ownsSession(sessionID);
+      }
+    }
+    if (foreign) {
       if (event.type === "session.created" && sessionID && typeof data.parentID === "string") {
         taskTracker.observeSessionCreated({ properties: { info: { id: sessionID, parentID: data.parentID } } });
       } else if (sessionID) {
@@ -3156,6 +3210,7 @@ async function setupV2(context) {
         if (!sessionID)
           return;
         stoppedExecutions.delete(sessionID);
+        sessionOwnership.delete(sessionID);
         busySessions.delete(sessionID);
         clearTurnWatchdog(sessionID);
         watchdogRescuedSessions.delete(sessionID);
@@ -3311,6 +3366,7 @@ async function setupV2(context) {
           name: command.name,
           description: command.description,
           execute: async (input) => {
+            markSessionOwnership(input.sessionID, true);
             if (command.action === "pause") {
               const goal = await getGoal(input.sessionID);
               if (goal?.status === "active")
@@ -3340,6 +3396,8 @@ async function setupV2(context) {
       }
     }));
     registrations.push(await context.session.hook("prompt", async (input) => {
+      if (typeof input.sessionID === "string")
+        markSessionOwnership(input.sessionID, true);
       const pauseTemplate = goalStatusCommandTemplate("pause_goal");
       const resumeTemplate = goalStatusCommandTemplate("resume_goal");
       const template = input.prompt.text.startsWith(pauseTemplate) ? pauseTemplate : input.prompt.text.startsWith(resumeTemplate) ? resumeTemplate : null;
@@ -3365,6 +3423,8 @@ async function setupV2(context) {
   registrations.push(await context.tool.hook("execute.before", async (input) => {
     taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id });
     const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined;
+    if (sessionID)
+      markSessionOwnership(sessionID, true);
     const callID = typeof input.id === "string" ? input.id : undefined;
     if (sessionID && callID) {
       const goal = await getGoalInternal(sessionID);

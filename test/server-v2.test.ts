@@ -83,6 +83,7 @@ function controlledStream() {
 
 type MockContext = {
   options: Record<string, unknown>
+  location?: { directory: string; workspaceID?: string | null }
   promptCalls: Array<{
     sessionID: string
     delivery?: "steer" | "queue"
@@ -92,6 +93,7 @@ type MockContext = {
   hooks: Record<string, (input: unknown) => void>
   systemParts: Array<{ type: string; text: string }>
   contextCalls: string[]
+  sessionGetCalls: string[]
   stream: ReturnType<typeof controlledStream>
   disposals: string[]
   command: {
@@ -109,6 +111,7 @@ type MockContext = {
       delivery?: "steer" | "queue"
     } & MockPrompt) => Promise<unknown>
     context: (input: { sessionID: string }) => Promise<unknown[]>
+    get: (input: { sessionID: string }) => Promise<{ data?: { location?: { directory: string; workspaceID?: string | null } } }>
   }
   event: {
     subscribe: (options?: { signal?: AbortSignal }) => AsyncIterable<unknown>
@@ -119,12 +122,15 @@ function makeMockContext(
   options: Record<string, unknown> = {},
   existingCommands: string[] = [],
   transcripts: Record<string, unknown[] | Promise<unknown[]>> = {},
+  location?: { directory: string; workspaceID?: string | null },
+  sessionInfos: Record<string, { location: { directory: string; workspaceID?: string | null } } | undefined> = {},
 ): MockContext {
   const tools: MockContext["tools"] = []
   const commands: MockContext["commands"] = []
   const hooks: MockContext["hooks"] = {}
   const promptCalls: MockContext["promptCalls"] = []
   const contextCalls: string[] = []
+  const sessionGetCalls: string[] = []
   const disposals: string[] = []
   const stream = controlledStream()
   const registration = (name: string): Registration => ({
@@ -134,12 +140,14 @@ function makeMockContext(
   })
   return {
     options,
+    location,
     promptCalls,
     tools,
     commands,
     hooks,
     systemParts: [],
     contextCalls,
+    sessionGetCalls,
     stream,
     disposals,
     command: {
@@ -171,6 +179,10 @@ function makeMockContext(
       context: async (input) => {
         contextCalls.push(input.sessionID)
         return transcripts[input.sessionID] ?? []
+      },
+      get: async (input: { sessionID: string }) => {
+        sessionGetCalls.push(input.sessionID)
+        return { data: sessionInfos[input.sessionID] }
       },
     },
     event: {
@@ -1085,6 +1097,60 @@ test("V2 global execution events only continue goals in the plugin instance loca
   expect(mock.promptCalls).toHaveLength(1)
   mock.stream.end()
   await cleanup()
+})
+
+test("V2 envelope-less session events stay foreign to sibling location instances", async () => {
+  const ownerLocation = { directory: "/srv/project", workspaceID: "ws_project" }
+  const siblingLocation = { directory: "/srv/other", workspaceID: "ws_other" }
+  const sessionInfos = { ses_shared: { location: ownerLocation } }
+  const owner = makeMockContext({ min_continue_interval_seconds: 0 }, [], {}, ownerLocation, sessionInfos)
+  const sibling = makeMockContext({ min_continue_interval_seconds: 0 }, [], {}, siblingLocation, sessionInfos)
+  const cleanupOwner = await setupPlugin(owner as never)
+  const cleanupSibling = await setupPlugin(sibling as never)
+  try {
+    await goalTool(owner, "create_goal").execute({ objective: "one shared server, one owning instance" }, toolContext("ses_shared"))
+    // The owning instance learns ownership from session.created's location.
+    await owner.stream.push({ type: "session.created", created: 1, data: { sessionID: "ses_shared", location: ownerLocation } })
+    // The sibling never saw the session created: every later event arrives
+    // without an envelope location and must be resolved against the session's
+    // actual location before the sibling may touch shared goal state.
+    for (const stream of [owner.stream, sibling.stream]) {
+      await stream.push({ type: "session.execution.started", created: 2, data: { sessionID: "ses_shared" } })
+      await stream.push({ type: "session.step.started", created: 3, data: { sessionID: "ses_shared", assistantMessageID: "msg_shared", agent: "build" } })
+      await stream.push({ type: "session.text.ended", created: 4, data: { sessionID: "ses_shared", assistantMessageID: "msg_shared", text: "A shared-server milestone settled." } })
+      await stream.push({ type: "session.step.ended", created: 5, data: { sessionID: "ses_shared", assistantMessageID: "msg_shared", tokens: { output: 50 } } })
+      await stream.push({ type: "session.usage.updated", created: 6, data: { sessionID: "ses_shared", tokens: { input: 10, output: 10 } } })
+    }
+    await owner.stream.push({ type: "session.execution.succeeded", created: 7, data: { sessionID: "ses_shared" } })
+    await sibling.stream.push({ type: "session.execution.succeeded", created: 7, data: { sessionID: "ses_shared" } })
+    await waitFor(() => owner.promptCalls.length === 1)
+    expect(owner.promptCalls[0]?.sessionID).toBe("ses_shared")
+    expect(sibling.promptCalls).toHaveLength(0)
+    expect(sibling.sessionGetCalls).toContain("ses_shared")
+    const goal = await getGoalInternal("ses_shared")
+    expect(goal?.autoTurns).toBe(1)
+    expect(goal?.checkpoints).toHaveLength(1)
+    // A single accounting pass from the owning instance produced both trackers.
+    const raw = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")) as {
+      goals: Record<string, { usageTrackers: Record<string, unknown>; tokensUsed: number }>
+    }
+    const tracked = Object.keys(raw.goals["ses_shared"]!.usageTrackers).sort()
+    expect(tracked).toEqual(["v2.session", "v2.steps"])
+    expect(raw.goals["ses_shared"]!.tokensUsed).toBeGreaterThan(0)
+    // A settled event that only the sibling observes must not reserve another
+    // continuation turn or duplicate the owner's accounting.
+    await sibling.stream.push({ type: "session.execution.succeeded", created: 8, data: { sessionID: "ses_shared" } })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(sibling.promptCalls).toHaveLength(0)
+    const afterSiblingOnly = await getGoalInternal("ses_shared")
+    expect(afterSiblingOnly?.autoTurns).toBe(1)
+    expect(afterSiblingOnly?.checkpoints).toHaveLength(1)
+  } finally {
+    owner.stream.end()
+    sibling.stream.end()
+    await cleanupSibling()
+    await cleanupOwner()
+  }
 })
 
 test("V2 fast execution success schedules the next continuation after the minimum interval", async () => {
