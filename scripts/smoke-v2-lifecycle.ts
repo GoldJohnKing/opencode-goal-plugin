@@ -115,7 +115,8 @@ const waitFor = async (stage: string, check: () => boolean | Promise<boolean>, d
     await Bun.sleep(50)
   }
   const details = diagnose?.()
-  throw new Error(`Smoke timeout at stage "${stage}"; modelCalls=${modelCalls}, continuationCalls=${continuationCalls}${details ? `; ${details}` : ""}; logs=${root}/server.log`)
+  const observed = `modelCalls=${modelCalls}, continuationCalls=${continuationCalls}${details ? `; ${details}` : ""}`
+  throw new Error(`Smoke timeout at stage "${stage}"; ${observed}; logs=${root}/server.log`)
 }
 let passed = false
 try {
@@ -170,7 +171,15 @@ try {
     const active = await api("/api/session/active") as { data: Record<string, unknown> }
     lastActiveSessionActive = sessionID in active.data
     return !lastActiveSessionActive
-  }, () => `goal status=${lastGoalStatus ?? "none"}, autoTurns=${lastAutoTurns ?? "none"}, outcome=${lastOutcome ?? "unknown"}, stillActive=${lastActiveSessionActive ?? "unknown"}`)
+  }, () => {
+    const parts = [
+      `goal status=${lastGoalStatus ?? "none"}`,
+      `autoTurns=${lastAutoTurns ?? "none"}`,
+      `outcome=${lastOutcome ?? "unknown"}`,
+      `stillActive=${lastActiveSessionActive ?? "unknown"}`,
+    ]
+    return parts.join(", ")
+  })
   assert.equal(state!.goals[sessionID]!.autoTurns, 2)
   assert(continuationCalls > 0)
   const arraysSession = await api("/api/session", {
@@ -190,7 +199,17 @@ try {
     try { state = JSON.parse(await readFile(env.OPENCODE_GOAL_STATE_PATH, "utf8")) } catch { return false }
     return state?.goals[arraysSession.data.id] != null
   })
-  console.log(JSON.stringify({ result: "PASS", packagePath, sessionID, modelCalls, continuationCalls, status: state!.goals[sessionID]!.status, autoTurns: state!.goals[sessionID]!.autoTurns, artifacts: root }, null, 2))
+  const summary = {
+    result: "PASS",
+    packagePath,
+    sessionID,
+    modelCalls,
+    continuationCalls,
+    status: state!.goals[sessionID]!.status,
+    autoTurns: state!.goals[sessionID]!.autoTurns,
+    artifacts: root,
+  }
+  console.log(JSON.stringify(summary, null, 2))
   passed = true
 } finally {
   child.kill()
@@ -203,7 +222,14 @@ try {
   // copied directory as an artifact via OPENCODE_SMOKE_ARTIFACTS_DIR.
   if (!passed) {
     try {
-      const summary = { failed: true, stage: lastStage ?? "unknown", modelCalls, continuationCalls, deadLineMs: deadline, finishedAt: Date.now() }
+      const summary = {
+        failed: true,
+        stage: lastStage ?? "unknown",
+        modelCalls,
+        continuationCalls,
+        deadlineAtMs: deadline,
+        finishedAt: Date.now(),
+      }
       await writeFile(join(root, "failure-summary.json"), JSON.stringify(summary))
       const artifactsDir = process.env.OPENCODE_SMOKE_ARTIFACTS_DIR
       if (artifactsDir) {
