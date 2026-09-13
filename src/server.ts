@@ -2263,7 +2263,15 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         if (event.type === "session.status" && isRecord(data.status) && typeof data.status.type === "string") {
           taskTracker.observeSessionStatus(sessionID, data.status.type)
         }
-        if (event.type === "session.deleted") taskTracker.observeSessionDeleted(sessionID)
+        if (event.type === "session.deleted") {
+          // Deleted sessions must free their cached ownership in every
+          // instance, not just the owner: a long-lived shared server would
+          // otherwise retain one negative entry per deleted session per
+          // sibling location forever, and a re-created session in another
+          // location could never be re-resolved.
+          taskTracker.observeSessionDeleted(sessionID)
+          sessionOwnership.delete(sessionID)
+        }
       }
       return
     }

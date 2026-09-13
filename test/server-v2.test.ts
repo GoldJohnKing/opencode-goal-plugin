@@ -1108,7 +1108,10 @@ test("V2 envelope-less session events stay foreign to sibling location instances
   const cleanupOwner = await setupPlugin(owner as never)
   const cleanupSibling = await setupPlugin(sibling as never)
   try {
-    await goalTool(owner, "create_goal").execute({ objective: "one shared server, one owning instance" }, toolContext("ses_shared"))
+    await goalTool(owner, "create_goal").execute(
+      { objective: "one shared server, one owning instance" },
+      toolContext("ses_shared"),
+    )
     // The owning instance learns ownership from session.created's location.
     await owner.stream.push({ type: "session.created", created: 1, data: { sessionID: "ses_shared", location: ownerLocation } })
     // The sibling never saw the session created: every later event arrives
@@ -1116,10 +1119,26 @@ test("V2 envelope-less session events stay foreign to sibling location instances
     // actual location before the sibling may touch shared goal state.
     for (const stream of [owner.stream, sibling.stream]) {
       await stream.push({ type: "session.execution.started", created: 2, data: { sessionID: "ses_shared" } })
-      await stream.push({ type: "session.step.started", created: 3, data: { sessionID: "ses_shared", assistantMessageID: "msg_shared", agent: "build" } })
-      await stream.push({ type: "session.text.ended", created: 4, data: { sessionID: "ses_shared", assistantMessageID: "msg_shared", text: "A shared-server milestone settled." } })
-      await stream.push({ type: "session.step.ended", created: 5, data: { sessionID: "ses_shared", assistantMessageID: "msg_shared", tokens: { output: 50 } } })
-      await stream.push({ type: "session.usage.updated", created: 6, data: { sessionID: "ses_shared", tokens: { input: 10, output: 10 } } })
+      await stream.push({
+        type: "session.step.started",
+        created: 3,
+        data: { sessionID: "ses_shared", assistantMessageID: "msg_shared", agent: "build" },
+      })
+      await stream.push({
+        type: "session.text.ended",
+        created: 4,
+        data: { sessionID: "ses_shared", assistantMessageID: "msg_shared", text: "A shared-server milestone settled." },
+      })
+      await stream.push({
+        type: "session.step.ended",
+        created: 5,
+        data: { sessionID: "ses_shared", assistantMessageID: "msg_shared", tokens: { output: 50 } },
+      })
+      await stream.push({
+        type: "session.usage.updated",
+        created: 6,
+        data: { sessionID: "ses_shared", tokens: { input: 10, output: 10 } },
+      })
     }
     await owner.stream.push({ type: "session.execution.succeeded", created: 7, data: { sessionID: "ses_shared" } })
     await sibling.stream.push({ type: "session.execution.succeeded", created: 7, data: { sessionID: "ses_shared" } })
@@ -1145,6 +1164,19 @@ test("V2 envelope-less session events stay foreign to sibling location instances
     const afterSiblingOnly = await getGoalInternal("ses_shared")
     expect(afterSiblingOnly?.autoTurns).toBe(1)
     expect(afterSiblingOnly?.checkpoints).toHaveLength(1)
+    // Deleting the session frees the sibling's cached foreign verdict: the
+    // next event for the same session ID re-resolves ownership instead of
+    // inheriting the stale negative entry.
+    expect(sibling.sessionGetCalls.filter((id) => id === "ses_shared")).toHaveLength(1)
+    await sibling.stream.push({ type: "session.deleted", created: 9, data: { sessionID: "ses_shared" } })
+    await sibling.stream.push({
+      type: "session.usage.updated",
+      created: 10,
+      data: { sessionID: "ses_shared", tokens: { input: 1, output: 1 } },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(sibling.sessionGetCalls.filter((id) => id === "ses_shared")).toHaveLength(2)
+    expect(sibling.promptCalls).toHaveLength(0)
   } finally {
     owner.stream.end()
     sibling.stream.end()

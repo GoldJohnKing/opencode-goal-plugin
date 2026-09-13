@@ -3098,8 +3098,10 @@ async function setupV2(context) {
         if (event.type === "session.status" && isRecord(data.status) && typeof data.status.type === "string") {
           taskTracker.observeSessionStatus(sessionID, data.status.type);
         }
-        if (event.type === "session.deleted")
+        if (event.type === "session.deleted") {
           taskTracker.observeSessionDeleted(sessionID);
+          sessionOwnership.delete(sessionID);
+        }
       }
       return;
     }
